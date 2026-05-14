@@ -50,6 +50,7 @@ const (
 	FeatureFindingsTable                = "findings_table"
 	FeatureCollectorSupportBundle       = "collector_support_bundle"
 	FeatureAlerts                       = "alerts"
+	FeatureVariableAnalysisMode         = "variable_analysis_mode"
 )
 
 // FeatureFlag defines the most basic details of what a feature flag must contain to be actionable. Feature flags should be
@@ -129,4 +130,12 @@ func GetOpenHoundEnabled(ctx context.Context, service GetFlagByKeyer) bool {
 // GetAlertsEnabled returns true if the Alerts feature flag is enabled.
 func GetAlertsEnabled(ctx context.Context, service GetFlagByKeyer) bool {
 	return GetFlagEnabled(ctx, service, FeatureAlerts)
+}
+
+func GetVariableAnalysisModeEnabled(ctx context.Context, service GetFlagByKeyer) bool {
+	if variableAnalysisModeFlag, err := service.GetFlagByKey(ctx, FeatureVariableAnalysisMode); err != nil {
+		return false
+	} else {
+		return variableAnalysisModeFlag.Enabled
+	}
 }
