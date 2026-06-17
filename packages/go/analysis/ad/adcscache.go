@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"github.com/specterops/bloodhound/packages/go/analysis/ad/wellknown"
@@ -138,6 +139,8 @@ type ADCSCache struct {
 	authStoreForChainValid          map[graph.ID]cardinality.Duplex[uint64] //Auth stores with a valid chain to the domain, key is domain ID
 	rootCAForChainValid             map[graph.ID]cardinality.Duplex[uint64] //Root CA with a valid chain to the domain, key is domain ID
 	hasHostingComputer              map[graph.ID]bool
+	ecaForestDomains                map[graph.ID]cardinality.Duplex[uint64] // enterprise CA ID -> domain IDs in the CA's own forest (SameForestTrust closure). Absent when the forest can't be resolved, which disables forest filtering for that CA.
+	hasInForestHostingComputer      map[graph.ID]bool                       // enterprise CA ID -> whether the CA has an enabled hosting computer inside its own forest
 
 	// ESC4-specific caches: principals with specific rights on cert templates, pre-computed to avoid per-ECA DB queries
 	certTemplateGenericWriters              map[graph.ID]CachedPrincipalSet         // principals with GenericWrite on a cert template
@@ -158,6 +161,8 @@ func NewADCSCache() *ADCSCache {
 		authStoreForChainValid:                  make(map[graph.ID]cardinality.Duplex[uint64]),
 		rootCAForChainValid:                     make(map[graph.ID]cardinality.Duplex[uint64]),
 		hasHostingComputer:                      make(map[graph.ID]bool),
+		ecaForestDomains:                        make(map[graph.ID]cardinality.Duplex[uint64]),
+		hasInForestHostingComputer:              make(map[graph.ID]bool),
 		certTemplateEnrollers:                   make(map[graph.ID]CachedPrincipalSet),
 		certTemplateControllers:                 make(map[graph.ID]CachedPrincipalSet),
 		enterpriseCAEnrollers:                   make(map[graph.ID]CachedPrincipalSet),
@@ -275,6 +280,15 @@ func (s *ADCSCache) BuildCache(ctx context.Context, db graph.Database, enterpris
 
 		certTemplateMeasure()
 
+		// Index domains by SID so a CA or computer can be mapped to its forest via
+		// its domainsid. SIDs are upper-cased to match collected node identifiers.
+		domainsBySID := make(map[string]*graph.Node, len(s.domains))
+		for _, domain := range s.domains {
+			if sid, err := domain.Properties.Get(common.ObjectID.String()).String(); err == nil && sid != "" {
+				domainsBySID[strings.ToUpper(sid)] = domain
+			}
+		}
+
 		ecaMeasure := measure.ContextMeasure(
 			ctx,
 			slog.LevelInfo,
@@ -327,18 +341,48 @@ func (s *ADCSCache) BuildCache(ctx context.Context, db graph.Database, enterpris
 					attr.Error(err),
 				)
 			} else {
-				hasHostingComputer := false
+				// Resolve the CA's own forest; fall back to forest-agnostic behavior
+				// when it can't be determined.
+				forestDomains, forestKnown, err := resolveEnterpriseCAForest(tx, eca, domainsBySID)
+				if err != nil {
+					slog.WarnContext(
+						ctx,
+						"Error resolving forest for enterprise ca",
+						slog.Uint64("enterprise_ca", uint64(eca.ID)),
+						attr.Error(err),
+					)
+				}
+
+				var (
+					hasHostingComputer = false
+					hostInForest       = false
+				)
 
 				for _, computer := range hostingComputers.Slice() {
 					if enabled, err := computer.Properties.Get(common.Enabled.String()).Bool(); err != nil {
 						continue
-					} else if enabled {
-						hasHostingComputer = true
-						break
+					} else if !enabled {
+						continue
+					}
+
+					hasHostingComputer = true
+
+					// Only count a host that lives in the CA's forest; a shared CA can
+					// be linked to a computer in another forest.
+					if forestKnown {
+						if computerSID, err := computer.Properties.Get(ad.DomainSID.String()).String(); err == nil && computerSID != "" {
+							if computerDomain, ok := domainsBySID[strings.ToUpper(computerSID)]; ok && forestDomains.Contains(computerDomain.ID.Uint64()) {
+								hostInForest = true
+							}
+						}
 					}
 				}
-				s.hasHostingComputer[eca.ID] = hasHostingComputer
 
+				s.hasHostingComputer[eca.ID] = hasHostingComputer
+				if forestKnown {
+					s.ecaForestDomains[eca.ID] = forestDomains
+					s.hasInForestHostingComputer[eca.ID] = hostInForest
+				}
 			}
 		}
 
@@ -455,6 +499,34 @@ func (s *ADCSCache) BuildCache(ctx context.Context, db graph.Database, enterpris
 	return err
 }
 
+// resolveEnterpriseCAForest returns the domain IDs in the CA's forest (the
+// SameForestTrust closure of the CA's domain, resolved from its domainsid). ok is
+// false when the forest can't be resolved, so callers fall back to forest-agnostic
+// behavior rather than dropping the CA.
+func resolveEnterpriseCAForest(tx graph.Transaction, eca *graph.Node, domainsBySID map[string]*graph.Node) (cardinality.Duplex[uint64], bool, error) {
+	domainSID, err := eca.Properties.Get(ad.DomainSID.String()).String()
+	if err != nil || domainSID == "" {
+		return nil, false, nil
+	}
+
+	caDomain, ok := domainsBySID[strings.ToUpper(domainSID)]
+	if !ok {
+		return nil, false, nil
+	}
+
+	forestNodes, err := FetchNodesWithSameForestTrustRelationship(tx, caDomain)
+	if err != nil {
+		return nil, false, err
+	}
+
+	forestDomains := graph.NodeSetToDuplex(forestNodes)
+	// Always include the CA's own domain (the closure is just the seed when there
+	// are no SameForestTrust edges).
+	forestDomains.Add(caDomain.ID.Uint64())
+
+	return forestDomains, true, nil
+}
+
 func (s *ADCSCache) GetECAHostedChainedDomains() map[uint64]*EnterpriseCAChainedDomains {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
@@ -464,15 +536,29 @@ func (s *ADCSCache) GetECAHostedChainedDomains() map[uint64]*EnterpriseCAChained
 	for _, enterpriseCA := range s.enterpriseCertAuthorities {
 		innerEnterpriseCA := enterpriseCA
 
+		forestDomains, forestKnown := s.ecaForestDomains[innerEnterpriseCA.ID]
+
+		// Require an enabled hosting computer; when the forest is known, require it
+		// in-forest. Drops CAs whose only host was matched across a forest boundary.
+		if forestKnown {
+			if !s.hasInForestHostingComputer[innerEnterpriseCA.ID] {
+				continue
+			}
+		} else if !s.hasHostingComputer[innerEnterpriseCA.ID] {
+			continue
+		}
+
 		targetDomains := NewEnterpriseCAChainedDomains(enterpriseCA)
 		for _, domain := range s.domains {
 			innerDomain := domain
 
-			if hasHost, ok := s.hasHostingComputer[innerEnterpriseCA.ID]; !ok {
+			// Skip domains outside the CA's forest so the ESC fan-out never reaches
+			// a foreign-forest domain.
+			if forestKnown && !forestDomains.Contains(innerDomain.ID.Uint64()) {
 				continue
-			} else if !hasHost {
-				continue
-			} else if _, ok := s.rootCAForChainValid[innerDomain.ID]; !ok {
+			}
+
+			if _, ok := s.rootCAForChainValid[innerDomain.ID]; !ok {
 				continue
 			} else if _, ok := s.authStoreForChainValid[innerDomain.ID]; !ok {
 				continue
@@ -498,9 +584,17 @@ func (s *ADCSCache) GetChainedDomains() map[uint64]*EnterpriseCAChainedDomains {
 	for _, enterpriseCA := range s.enterpriseCertAuthorities {
 		innerEnterpriseCA := enterpriseCA
 
+		forestDomains, forestKnown := s.ecaForestDomains[innerEnterpriseCA.ID]
+
 		targetDomains := NewEnterpriseCAChainedDomains(enterpriseCA)
 		for _, domain := range s.domains {
 			innerDomain := domain
+
+			// Skip domains outside the CA's forest, keeping EnrollOnBehalfOf linkage
+			// from crossing a forest boundary.
+			if forestKnown && !forestDomains.Contains(innerDomain.ID.Uint64()) {
+				continue
+			}
 
 			if _, ok := s.rootCAForChainValid[innerDomain.ID]; !ok {
 				continue
